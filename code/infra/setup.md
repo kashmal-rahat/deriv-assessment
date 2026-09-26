@@ -81,17 +81,17 @@ and `roles/bigquery.connectionUser` on the BigLake connection (to create BigLake
 
 ## 5. Load sample data
 
-`scripts/upload_sample_data.sh` copies `data/` into the layout above, simulating arrival dates
+`code/scripts/upload_sample_data.sh` copies `data/` into the layout above, simulating arrival dates
 (0301 on 2024-03-01, 0302 on 2024-03-02, 0303 arriving late on 2024-03-05, CDC on 2024-11-24).
 
 ## 6. Run the pipeline
 
-`scripts/dataform.sh` passes the environment variables above to the Dataform CLI:
+`code/scripts/dataform.sh` passes the environment variables above to the Dataform CLI:
 
 ```bash
-./scripts/dataform.sh compile
-AS_OF_DATE=2024-03-05 ./scripts/dataform.sh run     # replay the sample as of 2024-03-05
-./scripts/dataform.sh test                          # unit tests
+./code/scripts/dataform.sh compile
+AS_OF_DATE=2024-03-05 ./code/scripts/dataform.sh run     # replay the sample as of 2024-03-05
+./code/scripts/dataform.sh test                          # unit tests
 ```
 
 In production, a Dataform release configuration sets the same vars (project, bucket, connection) and a workflow

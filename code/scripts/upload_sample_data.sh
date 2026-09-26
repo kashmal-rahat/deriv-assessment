@@ -4,7 +4,7 @@ set -euo pipefail
 
 : "${GCS_BUCKET:?GCS_BUCKET must be set}"
 
-DATA_DIR="$(cd "$(dirname "$0")/../data" && pwd)"
+DATA_DIR="$(cd "$(dirname "$0")/../../data" && pwd)"
 DEST="gs://${GCS_BUCKET}"
 
 cp_obj() {

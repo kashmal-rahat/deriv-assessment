@@ -5,8 +5,8 @@ Work one step at a time. Check a step off when done and log decisions / changed 
 ## Steps
 
 - [x] 1. `PLAN.md` - step checklist and decision log
-- [x] 2. `docs/design.md` - Part 1a design document (architecture, idempotency, late/missing data, source deletes, edge cases)
-- [x] 3. `infra/setup.md` + `scripts/` - bucket layout, versioning/retention, BigLake connection, datasets, sample-data upload (commands documented, not executed)
+- [x] 2. `part1_pipeline.md` - Part 1a design document (architecture, idempotency, late/missing data, source deletes, edge cases)
+- [x] 3. `code/infra/setup.md` + `code/scripts/` - bucket layout, versioning/retention, BigLake connection, datasets, sample-data upload (commands documented, not executed)
 - [x] 4. Dataform bronze - raw-line BigLake tables (vendor, CDC, seeds), object table, `audit.file_manifest`
 - [x] 5. Silver staging - vendor header mapping + field-count check, CDC parsing + lsn ordering, seed parsing, typing, dedup, DQ severity
 - [x] 6. Silver core - `client_signup`, `client_trades`, `client_profile` (+ SCD2 history, `client_profile_active` view), `vendor_deposit`
@@ -20,12 +20,12 @@ Work one step at a time. Check a step off when done and log decisions / changed 
   - [ ] 8.6 Assertions
   - [ ] 8.7 Unit tests
 - [ ] 9. Validate - `dataform compile`, BigQuery dry runs, upload sample data, run with `AS_OF_DATE=2024-03-05`, check expected outcomes
-- [ ] 10. Part 2 - Gold dimensional model (Kimball star) and historization: `docs/data_model.md` + `dataform/definitions/gold/*` (placeholders created; see "Part 2 plan")
+- [ ] 10. Part 2 - Gold dimensional model (Kimball star) and historization: `part2_data_model.md` + `sql/gold/*` (placeholders created; see "Part 2 plan")
 - [x] 11. Part 3 - TL extension: `docs/part3.md` (real-time + batch, build vs buy). Design only; no new services stood up.
 
-- [x] 11. Part 3 - TL extension: `docs/tl_extension.md` (3a unified real-time + batch architecture, 3b build vs buy)
+- [x] 11. Part 3 - TL extension: `part3_architecture.md` (3a unified real-time + batch architecture, 3b build vs buy)
 
-## Part 3 summary (see `docs/tl_extension.md`)
+## Part 3 summary (see `part3_architecture.md`)
 - **3a:** Pub/Sub event log (schema registry, `event_id`) with two independent consumers:
   - Dataflow streaming + Bigtable features + Vertex AI/rules for fraud signals, p99 under 2 s;
   - the existing GCS/BigQuery/Dataform medallion for batch.
@@ -172,11 +172,11 @@ Each dimension has a `-1` "Unknown" member.
    - Bronze is immutable and CDC is `lsn`-guarded, so the reload is repeatable.
 
 ### Part 2 files (placeholders, to implement)
-- `docs/data_model.md` - Part 2a/2b write-up (from this section).
-- `dataform/definitions/gold/dim_date.sqlx`, `dim_client.sqlx`, `dim_instrument.sqlx`, `dim_payment_method.sqlx`, `dim_currency.sqlx`, `dim_deposit_junk.sqlx`, `dim_trade_junk.sqlx`
-- `dataform/definitions/gold/fact_deposit.sqlx`, `fact_trade.sqlx`, `fact_client_balance_daily.sqlx`, `fact_deposit_reconciliation_daily.sqlx`
-- `dataform/definitions/gold/dim_client_current.sqlx` (view)
-- `dataform/definitions/gold/reprocess_client_history.sqlx` (range reload operation)
+- `part2_data_model.md` - Part 2a/2b write-up (from this section).
+- `sql/gold/dim_date.sqlx`, `dim_client.sqlx`, `dim_instrument.sqlx`, `dim_payment_method.sqlx`, `dim_currency.sqlx`, `dim_deposit_junk.sqlx`, `dim_trade_junk.sqlx`
+- `sql/gold/fact_deposit.sqlx`, `fact_trade.sqlx`, `fact_client_balance_daily.sqlx`, `fact_deposit_reconciliation_daily.sqlx`
+- `sql/gold/dim_client_current.sqlx` (view)
+- `sql/gold/reprocess_client_history.sqlx` (range reload operation)
 
 ## Remaining plan
 
@@ -210,9 +210,9 @@ Code written so far has **not been compiled or run** (agreed, due to time). Step
 - `stg_deposit_match`: exact match NOOP, composite match LINK, client mismatch BLOCKED, two candidates -> BLOCKED_AMBIGUOUS_MATCH, no candidate -> INSERT.
 
 ### 9. Validation
-1. `./scripts/dataform.sh compile` and fix compile errors.
+1. `./code/scripts/dataform.sh compile` and fix compile errors.
 2. BigQuery dry run of each compiled query (`maximum_bytes_billed` set).
-3. After approval: run `infra/setup.md`, `scripts/upload_sample_data.sh`, then `AS_OF_DATE=2024-03-05 ./scripts/dataform.sh run` and `test`.
+3. After approval: run `code/infra/setup.md`, `code/scripts/upload_sample_data.sh`, then `AS_OF_DATE=2024-03-05 ./code/scripts/dataform.sh run` and `test`.
 4. Expected outcomes to check: VDEP001 and DEP012 quarantined; VDEP020 ORPHAN_PENDING (CL099, arrived 2024-03-05) and DEP020 quarantined (CL031); 0303 rows loaded despite back-dating; VDEP002/VDEP005 no-op on redelivery; CL014 ends `medium`; CL012 soft-deleted; vendor rows inserted with `source_system = 'VENDOR'` (no id overlap with DEP*).
 
 ## Agreed decisions
@@ -231,7 +231,7 @@ Code written so far has **not been compiled or run** (agreed, due to time). Step
 | D10 | Late/missing: bronze is partitioned by **arrival** date, so a back-dated late file always falls in the recent arrival window (7-day lookback). Recon recomputes affected business dates; states self-heal (PENDING -> MATCHED / MISSING_IN_VENDOR after 3-day grace). Orphans retried until grace, then quarantined. |
 | D11 | CDC: snapshot is version 0 at baseline lsn 1000; versions folded in lsn order with key-presence semantics (absent key = unchanged, explicit null = set null); before-image drift check; insert on existing key = upsert; soft delete + SCD2 history; PII erasure op for deleted clients after retention. |
 | D12 | DQ severity: ERROR -> `quarantine.rejected_records` (never loaded); WARN -> loaded with `dq_flags` and logged to `audit.dq_issues`. |
-| D13 | Environment config (project, location, bucket, connection) comes from environment variables passed to the Dataform CLI by `scripts/dataform.sh`; `workflow_settings.yaml` only has placeholders. |
+| D13 | Environment config (project, location, bucket, connection) comes from environment variables passed to the Dataform CLI by `code/scripts/dataform.sh`; `workflow_settings.yaml` only has placeholders. |
 | D14 | `as_of_date` var drives grace/lookback/SLA logic (defaults to `CURRENT_DATE()`); set it explicitly to replay history (sample data uses `2024-03-05`). |
 | D15 | Real-time fraud is a separate path: payments outbox → Pub/Sub → Dataflow → `fraud.signals` + `realtime` dataset. It never writes silver or gold. Dataform stays the only writer of the book of record and the weekly report reads gold only. D3 still applies to the batch graph. |
 | D16 | A new payment processor is onboarded by building a thin lander into GCS (raw prefix + header map + existing DQ/recon), not Fivetran or RudderStack. Buy Fivetran extract-only only if several non-file sources show up or legal accepts a certified connector. |

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wraps the Dataform CLI so environment-specific settings come from environment variables.
-# Usage: ./scripts/dataform.sh <compile|run|test> [extra dataform args]
+# Usage: ./code/scripts/dataform.sh <compile|run|test> [extra dataform args]
 set -euo pipefail
 
 : "${GCP_PROJECT:?GCP_PROJECT must be set}"

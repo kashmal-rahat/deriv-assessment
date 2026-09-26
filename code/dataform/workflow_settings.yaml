@@ -1,4 +1,4 @@
-# Placeholders only. Real values are injected by scripts/dataform.sh from environment variables
+# Placeholders only. Real values are injected by code/scripts/dataform.sh from environment variables
 # (or by a Dataform release configuration in production).
 defaultProject: your-gcp-project
 defaultLocation: US

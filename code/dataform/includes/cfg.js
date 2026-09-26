@@ -3,7 +3,7 @@ const vars = dataform.projectConfig.vars || {};
 function requiredVar(name) {
   const value = vars[name];
   if (!value) {
-    throw new Error(`Dataform var '${name}' is required (set it via scripts/dataform.sh)`);
+    throw new Error(`Dataform var '${name}' is required (set it via code/scripts/dataform.sh)`);
   }
   return value;
 }
