@@ -1,0 +1,94 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "deposit", "recon"],
+  description: "Two-pass, one-to-one match of recently arrived vendor deposits to client_deposit, and the action to take. Pass 1: exact deposit_id or previously linked vendor id. Pass 2: same client + currency, amount within tolerance, date within tolerance."
+}
+
+js {
+  const tol = (a, b) => `ABS(${a} - ${b}) <= GREATEST(${cfg.AMOUNT_TOLERANCE_MIN_USD}, ${cfg.AMOUNT_TOLERANCE_PCT} * ABS(${b}))`;
+  const cmp = (alias) => `TO_JSON_STRING(STRUCT(${["deposit_date", "amount_usd", "payment_method", "currency_original",
+    "exchange_rate", "status", "processing_days", "fee_usd"].map((c) => `${alias}.${c} AS ${c}`).join(", ")}))`;
+}
+
+WITH vendor AS (
+  SELECT *
+  FROM ${ref("vendor_deposit")}
+  WHERE arrival_date >= DATE_SUB(${cfg.AS_OF_DATE}, INTERVAL ${cfg.LOOKBACK_DAYS} DAY)
+),
+
+wh AS (
+  SELECT * FROM ${ref("client_deposit")}
+),
+
+exact AS (
+  SELECT v.deposit_id AS vendor_deposit_id, w.source_system, w.deposit_id AS wh_deposit_id
+  FROM vendor AS v
+  JOIN wh AS w ON w.deposit_id = v.deposit_id
+  UNION DISTINCT
+  SELECT v.deposit_id, w.source_system, w.deposit_id
+  FROM vendor AS v
+  JOIN wh AS w ON w.vendor_deposit_id = v.deposit_id
+),
+
+composite AS (
+  SELECT v.deposit_id AS vendor_deposit_id, w.source_system, w.deposit_id AS wh_deposit_id
+  FROM vendor AS v
+  JOIN wh AS w
+    ON w.client_id = v.client_id
+    AND w.currency_original = v.currency_original
+  WHERE w.source_system = 'INTERNAL'
+    AND w.vendor_deposit_id IS NULL
+    AND ${tol("w.amount_usd", "v.amount_usd")}
+    AND ABS(DATE_DIFF(w.deposit_date, v.deposit_date, DAY)) <= ${cfg.DATE_TOLERANCE_DAYS}
+    AND v.deposit_id NOT IN (SELECT vendor_deposit_id FROM exact)
+    AND NOT EXISTS (
+      SELECT 1 FROM exact AS e WHERE e.source_system = w.source_system AND e.wh_deposit_id = w.deposit_id
+    )
+),
+
+candidates AS (
+  SELECT
+    *,
+    COUNT(*) OVER (PARTITION BY vendor_deposit_id) AS n_wh,
+    COUNT(*) OVER (PARTITION BY source_system, wh_deposit_id) AS n_vendor
+  FROM (
+    SELECT *, 'EXACT' AS match_type FROM exact
+    UNION ALL
+    SELECT *, 'COMPOSITE' AS match_type FROM composite
+  )
+),
+
+resolved AS (
+  SELECT
+    vendor_deposit_id,
+    ANY_VALUE(match_type) AS match_type,
+    MAX(n_wh) > 1 OR MAX(n_vendor) > 1 AS is_ambiguous,
+    IF(MAX(n_wh) = 1 AND MAX(n_vendor) = 1, ANY_VALUE(source_system), NULL) AS source_system,
+    IF(MAX(n_wh) = 1 AND MAX(n_vendor) = 1, ANY_VALUE(wh_deposit_id), NULL) AS wh_deposit_id
+  FROM candidates
+  GROUP BY vendor_deposit_id
+)
+
+SELECT
+  v.deposit_id AS vendor_deposit_id,
+  v.source_uri AS vendor_source_uri,
+  v.vendor_file_date,
+  v.deposit_date AS vendor_deposit_date,
+  COALESCE(r.match_type, 'NONE') AS match_type,
+  r.source_system AS wh_source_system,
+  r.wh_deposit_id,
+  CASE
+    WHEN r.is_ambiguous THEN 'BLOCKED_AMBIGUOUS_MATCH'
+    WHEN r.vendor_deposit_id IS NULL THEN 'INSERT'
+    WHEN w.client_id != v.client_id THEN 'BLOCKED_CLIENT_MISMATCH'
+    WHEN w.currency_original != v.currency_original
+      OR NOT (${tol("w.amount_usd", "v.amount_usd")}) THEN 'BLOCKED_AMOUNT_MISMATCH'
+    WHEN w.vendor_file_date > v.vendor_file_date THEN 'SKIP_STALE'
+    WHEN ${cmp("w")} = ${cmp("v")} AND w.vendor_deposit_id IS NULL THEN 'LINK'
+    WHEN ${cmp("w")} = ${cmp("v")} THEN 'NOOP'
+    ELSE 'OVERWRITE'
+  END AS action
+FROM vendor AS v
+LEFT JOIN resolved AS r ON r.vendor_deposit_id = v.deposit_id
+LEFT JOIN wh AS w ON w.source_system = r.source_system AND w.deposit_id = r.wh_deposit_id

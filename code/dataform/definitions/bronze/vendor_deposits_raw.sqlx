@@ -1,0 +1,15 @@
+config {
+  type: "operations",
+  schema: "bronze",
+  hasOutput: true,
+  tags: ["bronze"],
+  description: "Vendor deposit CSVs as raw lines (one STRING column), Hive-partitioned by arrival_date. Headers are mapped by name in silver_staging."
+}
+
+CREATE OR REPLACE EXTERNAL TABLE ${self()}
+${helpers.rawLineTableDdl({
+  connection: cfg.CONNECTION,
+  uriPrefix: `gs://${cfg.BUCKET}/vendor`,
+  hivePartitioned: true,
+  delimiter: cfg.RAW_LINE_DELIMITER
+})}

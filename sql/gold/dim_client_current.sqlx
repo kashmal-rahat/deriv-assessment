@@ -1,0 +1,3 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): dim_client_current - view over dim_client WHERE is_current AND NOT is_deleted.

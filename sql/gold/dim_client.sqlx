@@ -1,0 +1,11 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): dim_client - SCD2 client dimension.
+-- Source: silver.client_signup + silver.client_profile_history (versions already folded in lsn order).
+-- Key: client_sk = FARM_FINGERPRINT(client_id || version_lsn) (deterministic, stable across reloads); durable key client_id.
+-- SCD2: risk_category, account_status, kyc_status, account_type. Type 6: current_risk_category, current_account_status.
+-- SCD1: full_name, email, country (PII, policy tags). account_balance_usd is NOT here (see fact_client_balance_daily).
+-- Balance-only CDC changes do not create a new version.
+-- Columns: valid_from, valid_to, is_current, is_deleted, deleted_at, is_inferred.
+-- Late-arriving: inferred member rows (is_inferred = TRUE, 'Unknown' attributes) are filled in place when the real row lands.
+-- Includes a -1 'Unknown' member. Cluster by client_id.

@@ -1,6 +1,6 @@
 ## Project
-- Goal:
-- Stack: 
+- Goal: Design and document a production-grade data engineering solution for a financial trading platform. 
+- Stack: GCP, Bigquery, Cloud Storage, Dataform
 
 
 ## Rules

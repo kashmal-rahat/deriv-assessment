@@ -1,0 +1,83 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "seed", "trades"],
+  description: "Typed and validated client_trades rows from the seed."
+}
+
+js {
+  const known = ["trade_id", "client_id", "trade_date", "instrument", "direction", "volume_lots",
+    "open_price", "close_price", "pnl_usd", "trade_status"];
+}
+
+WITH typed AS (
+  SELECT
+    source_uri,
+    raw_payload,
+    j IS NULL AS is_unparseable,
+    UPPER(${helpers.jsonValue("j", "trade_id", "STRING")}) AS trade_id,
+    UPPER(${helpers.jsonValue("j", "client_id", "STRING")}) AS client_id,
+    ${helpers.jsonValue("j", "trade_date", "DATE")} AS trade_date,
+    ${helpers.jsonValue("j", "instrument", "STRING")} AS instrument,
+    LOWER(${helpers.jsonValue("j", "direction", "STRING")}) AS direction,
+    ${helpers.jsonValue("j", "volume_lots", "NUMERIC")} AS volume_lots,
+    ${helpers.jsonValue("j", "open_price", "NUMERIC")} AS open_price,
+    ${helpers.jsonValue("j", "close_price", "NUMERIC")} AS close_price,
+    ${helpers.jsonValue("j", "pnl_usd", "NUMERIC")} AS pnl_usd,
+    LOWER(${helpers.jsonValue("j", "trade_status", "STRING")}) AS trade_status,
+    NULLIF(ARRAY_TO_STRING(ARRAY(
+      SELECT k FROM UNNEST(JSON_KEYS(j, 1)) AS k WHERE k NOT IN (${helpers.sqlList(known)}) ORDER BY k
+    ), ','), '') AS unmapped_keys
+  FROM ${ref("stg_seed_client_trades_json")}
+),
+
+checked AS (
+  SELECT
+    t.*,
+    ${helpers.codes([
+      ["t.is_unparseable", "UNPARSEABLE_JSON"],
+      ["NOT t.is_unparseable AND t.trade_id IS NULL", "MISSING_TRADE_ID"],
+      ["NOT t.is_unparseable AND t.client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["NOT t.is_unparseable AND t.trade_date IS NULL", "INVALID_TRADE_DATE"],
+      ["NOT t.is_unparseable AND (t.direction IS NULL OR t.direction NOT IN (" + helpers.sqlList(cfg.TRADE_DIRECTIONS) + "))", "UNKNOWN_DIRECTION"],
+      ["NOT t.is_unparseable AND (t.volume_lots IS NULL OR t.volume_lots <= 0)", "INVALID_VOLUME"],
+      ["NOT t.is_unparseable AND (t.open_price IS NULL OR t.open_price <= 0)", "INVALID_OPEN_PRICE"],
+      ["t.close_price <= 0", "INVALID_CLOSE_PRICE"],
+      ["NOT t.is_unparseable AND (t.trade_status IS NULL OR t.trade_status NOT IN (" + helpers.sqlList(cfg.TRADE_STATUSES) + "))", "UNKNOWN_TRADE_STATUS"],
+      ["t.trade_status = 'closed' AND (t.close_price IS NULL OR t.pnl_usd IS NULL)", "CLOSED_TRADE_MISSING_CLOSE"],
+      ["t.trade_id IS NOT NULL AND t.key_rows > 1", "DUPLICATE_TRADE_ID"],
+      ["t.client_id IS NOT NULL AND s.client_id IS NULL", "ORPHAN_CLIENT"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      ["t.trade_date < s.signup_date", "TRADE_BEFORE_SIGNUP"],
+      ["s.kyc_status != 'approved'", "KYC_NOT_APPROVED"],
+      // PnL must be zero on a flat price and share the sign of the directional price move.
+      [`t.trade_status = 'closed' AND (
+          (t.close_price = t.open_price AND t.pnl_usd != 0)
+          OR SIGN(t.pnl_usd) * SIGN(IF(t.direction = 'buy', 1, -1) * (t.close_price - t.open_price)) < 0)`, "PNL_INCONSISTENT"],
+      ["p.account_status IN ('inactive', 'suspended') AND t.trade_date > p.last_login_date", "TRADE_ON_INACTIVE_ACCOUNT"],
+      ["t.unmapped_keys IS NOT NULL", "UNMAPPED_KEYS"]
+    ])} AS warn_codes
+  FROM (SELECT *, COUNT(*) OVER (PARTITION BY trade_id) AS key_rows FROM typed) AS t
+  LEFT JOIN ${ref("client_signup")} AS s ON s.client_id = t.client_id
+  LEFT JOIN ${ref("client_profile")} AS p ON p.client_id = t.client_id
+)
+
+SELECT
+  source_uri,
+  raw_payload,
+  trade_id,
+  client_id,
+  trade_date,
+  instrument,
+  direction,
+  volume_lots,
+  open_price,
+  close_price,
+  pnl_usd,
+  trade_status,
+  unmapped_keys,
+  error_codes,
+  warn_codes,
+  IF(error_codes IS NULL, 'VALID', 'REJECTED') AS record_status
+FROM checked

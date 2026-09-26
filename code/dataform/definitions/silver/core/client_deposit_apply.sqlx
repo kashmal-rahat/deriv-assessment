@@ -1,0 +1,113 @@
+config {
+  type: "operations",
+  schema: "silver",
+  tags: ["core", "deposit", "recon"],
+  dependencies: ["client_deposit", "deposit_conflicts", "deposit_match"],
+  description: "Applies vendor priority to client_deposit in one transaction: logs conflicts (with prior warehouse values), upserts the match state, then INSERT / OVERWRITE / LINK. BLOCKED and SKIP_STALE rows are logged but never applied."
+}
+
+js {
+  const ops = ["deposit_date", "amount_usd", "payment_method", "exchange_rate", "status", "processing_days", "fee_usd"];
+  const valuesJson = (alias) => `TO_JSON(STRUCT(${["client_id"].concat(ops, ["currency_original"])
+    .map((c) => `${alias}.${c} AS ${c}`).join(", ")}))`;
+}
+
+-- Snapshot decisions before the transaction so every statement sees the same match set.
+CREATE TEMP TABLE match_decisions AS
+SELECT
+  m.*,
+  v.row_hash AS vendor_row_hash,
+  ${valuesJson("v")} AS vendor_values,
+  IF(w.deposit_id IS NULL, NULL, ${valuesJson("w")}) AS warehouse_values_before,
+  v.client_id, v.currency_original, v.dq_flags,
+  ${ops.map((c) => `v.${c}`).join(", ")}
+FROM ${ref("stg_deposit_match")} AS m
+JOIN ${ref("vendor_deposit")} AS v ON v.deposit_id = m.vendor_deposit_id
+LEFT JOIN ${ref("client_deposit")} AS w
+  ON w.source_system = m.wh_source_system AND w.deposit_id = m.wh_deposit_id;
+
+BEGIN
+  BEGIN TRANSACTION;
+
+  MERGE ${ref("deposit_conflicts")} AS c
+  USING (
+    SELECT
+      TO_HEX(SHA256(CONCAT(vendor_deposit_id, '|', vendor_row_hash, '|', action, '|',
+        IFNULL(wh_source_system, ''), '|', IFNULL(wh_deposit_id, '')))) AS conflict_id,
+      *
+    FROM match_decisions
+    WHERE action != 'NOOP'
+  ) AS s
+  ON c.conflict_id = s.conflict_id
+  WHEN NOT MATCHED THEN INSERT (
+    conflict_id, detected_at, vendor_deposit_id, vendor_source_uri, vendor_file_date, match_type,
+    wh_source_system, wh_deposit_id, action, resolution_status, vendor_values, warehouse_values_before
+  ) VALUES (
+    s.conflict_id, CURRENT_TIMESTAMP(), s.vendor_deposit_id, s.vendor_source_uri, s.vendor_file_date, s.match_type,
+    s.wh_source_system, s.wh_deposit_id, s.action,
+    CASE
+      WHEN STARTS_WITH(s.action, 'BLOCKED') THEN 'OPEN'
+      WHEN s.action = 'SKIP_STALE' THEN 'IGNORED'
+      ELSE 'APPLIED'
+    END,
+    s.vendor_values, s.warehouse_values_before
+  );
+
+  MERGE ${ref("deposit_match")} AS t
+  USING match_decisions AS s
+  ON t.vendor_deposit_id = s.vendor_deposit_id
+  WHEN MATCHED THEN UPDATE SET
+    vendor_source_uri = s.vendor_source_uri,
+    vendor_file_date = s.vendor_file_date,
+    vendor_deposit_date = s.vendor_deposit_date,
+    match_type = s.match_type,
+    wh_source_system = s.wh_source_system,
+    wh_deposit_id = s.wh_deposit_id,
+    action = s.action,
+    decided_at = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED THEN INSERT (
+    vendor_deposit_id, vendor_source_uri, vendor_file_date, vendor_deposit_date, match_type,
+    wh_source_system, wh_deposit_id, action, decided_at
+  ) VALUES (
+    s.vendor_deposit_id, s.vendor_source_uri, s.vendor_file_date, s.vendor_deposit_date, s.match_type,
+    s.wh_source_system, s.wh_deposit_id, s.action, CURRENT_TIMESTAMP()
+  );
+
+  MERGE ${ref("client_deposit")} AS t
+  USING (
+    SELECT
+      IF(action = 'INSERT', 'VENDOR', wh_source_system) AS source_system,
+      IF(action = 'INSERT', vendor_deposit_id, wh_deposit_id) AS deposit_id,
+      *
+    FROM match_decisions
+    WHERE action IN ('INSERT', 'OVERWRITE', 'LINK')
+  ) AS s
+  ON t.source_system = s.source_system AND t.deposit_id = s.deposit_id
+  WHEN MATCHED AND s.action = 'OVERWRITE' THEN UPDATE SET
+    ${ops.map((c) => `${c} = s.${c}`).join(",\n    ")},
+    vendor_deposit_id = s.vendor_deposit_id,
+    last_vendor_file = s.vendor_source_uri,
+    vendor_file_date = s.vendor_file_date,
+    recon_status = 'CORRECTED_FROM_VENDOR',
+    dq_flags = ARRAY(SELECT DISTINCT f FROM UNNEST(ARRAY_CONCAT(t.dq_flags, s.dq_flags)) AS f),
+    _updated_at = CURRENT_TIMESTAMP()
+  WHEN MATCHED AND s.action = 'LINK' THEN UPDATE SET
+    vendor_deposit_id = s.vendor_deposit_id,
+    last_vendor_file = s.vendor_source_uri,
+    vendor_file_date = s.vendor_file_date,
+    recon_status = 'MATCHED',
+    _updated_at = CURRENT_TIMESTAMP()
+  WHEN NOT MATCHED AND s.action = 'INSERT' THEN INSERT (
+    source_system, deposit_id, client_id, ${ops.join(", ")}, currency_original,
+    vendor_deposit_id, last_vendor_file, vendor_file_date, recon_status, dq_flags, _created_at, _updated_at
+  ) VALUES (
+    'VENDOR', s.deposit_id, s.client_id, ${ops.map((c) => `s.${c}`).join(", ")}, s.currency_original,
+    s.vendor_deposit_id, s.vendor_source_uri, s.vendor_file_date, 'INSERTED_FROM_VENDOR', s.dq_flags,
+    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+  );
+
+  COMMIT TRANSACTION;
+EXCEPTION WHEN ERROR THEN
+  ROLLBACK TRANSACTION;
+  RAISE USING MESSAGE = CONCAT('client_deposit_apply failed and was rolled back: ', @@error.message);
+END;

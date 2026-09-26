@@ -1,0 +1,49 @@
+config {
+  type: "operations",
+  schema: "silver",
+  hasOutput: true,
+  tags: ["core", "cdc"],
+  description: "Current client profile (1:1 with client_signup). Soft delete: is_deleted / deleted_at / deleted_lsn. A version is applied only when its lsn is greater than last_applied_lsn, so replays and out-of-order files cannot move state backwards."
+}
+
+js {
+  const cols = cfg.PROFILE_COLUMNS;
+  const colDdl = cols.map((c) => `${c.name} ${c.type}`).join(",\n  ");
+  const all = cols.map((c) => c.name).concat(["is_deleted", "deleted_at", "deleted_lsn"]);
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  client_id STRING NOT NULL,
+  ${colDdl},
+  is_deleted BOOL NOT NULL,
+  deleted_at TIMESTAMP,
+  deleted_lsn INT64,
+  last_applied_lsn INT64 NOT NULL,
+  last_commit_ts TIMESTAMP,
+  dq_flags ARRAY<STRING>,
+  _updated_at TIMESTAMP NOT NULL
+)
+CLUSTER BY client_id
+OPTIONS (description = 'Current client profile with soft delete; see client_profile_history for SCD2.');
+
+MERGE ${self()} AS t
+USING (
+  SELECT
+    v.*,
+    IF(v.op = 'snapshot', NULL, v.valid_from) AS commit_ts,
+    IFNULL(SPLIT(v.warn_codes, ','), []) AS dq_flags
+  FROM ${ref("stg_client_profile_versions")} AS v
+  WHERE v.is_current
+) AS s
+ON t.client_id = s.client_id
+WHEN MATCHED AND s.version_lsn > t.last_applied_lsn THEN UPDATE SET
+  ${all.map((c) => `${c} = s.${c}`).join(",\n  ")},
+  last_applied_lsn = s.version_lsn,
+  last_commit_ts = s.commit_ts,
+  dq_flags = s.dq_flags,
+  _updated_at = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  client_id, ${all.join(", ")}, last_applied_lsn, last_commit_ts, dq_flags, _updated_at
+) VALUES (
+  s.client_id, ${all.map((c) => `s.${c}`).join(", ")}, s.version_lsn, s.commit_ts, s.dq_flags, CURRENT_TIMESTAMP()
+);

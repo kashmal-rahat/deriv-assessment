@@ -1,0 +1,87 @@
+config {
+  type: "incremental",
+  schema: "recon",
+  tags: ["recon"],
+  dependencies: ["client_deposit_apply"],
+  bigquery: { partitionBy: "deposit_date", clusterBy: ["recon_status", "client_id"] },
+  description: "Vendor vs warehouse reconciliation per deposit. Incremental runs delete and rebuild only the affected business dates, so states self-heal: PENDING becomes MATCHED / CORRECTED_FROM_VENDOR when a late file lands, or MISSING_IN_VENDOR after the grace window."
+}
+
+pre_operations {
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE deposit_date IN (SELECT deposit_date FROM ${ref("stg_recon_affected_dates")})`)}
+}
+
+WITH vendor_side AS (
+  SELECT
+    COALESCE(w.deposit_date, v.deposit_date) AS deposit_date,
+    m.vendor_deposit_id AS recon_key,
+    m.vendor_deposit_id,
+    m.wh_source_system,
+    m.wh_deposit_id,
+    v.client_id,
+    m.match_type,
+    v.amount_usd AS vendor_amount_usd,
+    w.amount_usd AS wh_amount_usd,
+    v.status AS vendor_status,
+    w.status AS wh_status,
+    CASE
+      WHEN STARTS_WITH(m.action, 'BLOCKED') THEN m.action
+      WHEN m.action = 'SKIP_STALE' THEN 'STALE_VENDOR_RECORD'
+      WHEN w.source_system = 'VENDOR' THEN 'INSERTED_FROM_VENDOR'
+      WHEN w.recon_status = 'CORRECTED_FROM_VENDOR' THEN 'CORRECTED_FROM_VENDOR'
+      WHEN w.deposit_id IS NOT NULL THEN 'MATCHED'
+      ELSE 'PENDING_APPLY'
+    END AS recon_status
+  FROM (
+    SELECT
+      *,
+      IF(action = 'INSERT', 'VENDOR', wh_source_system) AS target_source_system,
+      IF(action = 'INSERT', vendor_deposit_id, wh_deposit_id) AS target_deposit_id
+    FROM ${ref("deposit_match")}
+  ) AS m
+  JOIN ${ref("vendor_deposit")} AS v ON v.deposit_id = m.vendor_deposit_id
+  LEFT JOIN ${ref("client_deposit")} AS w
+    ON w.source_system = m.target_source_system AND w.deposit_id = m.target_deposit_id
+),
+
+blocked_targets AS (
+  SELECT DISTINCT wh_source_system, wh_deposit_id
+  FROM ${ref("deposit_match")}
+  WHERE STARTS_WITH(action, 'BLOCKED') AND wh_deposit_id IS NOT NULL
+),
+
+internal_side AS (
+  SELECT
+    w.deposit_date,
+    CONCAT(w.source_system, ':', w.deposit_id) AS recon_key,
+    CAST(NULL AS STRING) AS vendor_deposit_id,
+    w.source_system AS wh_source_system,
+    w.deposit_id AS wh_deposit_id,
+    w.client_id,
+    'NONE' AS match_type,
+    CAST(NULL AS NUMERIC) AS vendor_amount_usd,
+    w.amount_usd AS wh_amount_usd,
+    CAST(NULL AS STRING) AS vendor_status,
+    w.status AS wh_status,
+    IF(DATE_DIFF(${cfg.AS_OF_DATE}, w.deposit_date, DAY) <= ${cfg.GRACE_DAYS}, 'PENDING', 'MISSING_IN_VENDOR') AS recon_status
+  FROM ${ref("client_deposit")} AS w
+  LEFT JOIN blocked_targets AS b
+    ON b.wh_source_system = w.source_system AND b.wh_deposit_id = w.deposit_id
+  WHERE w.source_system = 'INTERNAL'
+    AND w.vendor_deposit_id IS NULL
+    AND b.wh_deposit_id IS NULL
+    AND w.deposit_date BETWEEN DATE '${cfg.RECON_START_DATE}' AND ${cfg.AS_OF_DATE}
+)
+
+SELECT
+  *,
+  ${cfg.AS_OF_DATE} AS as_of_date,
+  CURRENT_TIMESTAMP() AS reconciled_at
+FROM (
+  SELECT * FROM vendor_side
+  UNION ALL
+  SELECT * FROM internal_side
+)
+${when(incremental(),
+  `WHERE deposit_date IN (SELECT deposit_date FROM ${ref("stg_recon_affected_dates")})`)}

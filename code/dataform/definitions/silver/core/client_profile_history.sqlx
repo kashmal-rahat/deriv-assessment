@@ -1,0 +1,24 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  uniqueKey: ["client_id", "version_lsn"],
+  tags: ["core", "cdc"],
+  bigquery: { clusterBy: ["client_id"] },
+  description: "SCD2 history of client_profile: one row per version (snapshot = version 0). Deletes are versions too. valid_to is NULL on the current version.",
+  assertions: { uniqueKey: ["client_id", "version_lsn"] }
+}
+
+-- Re-emit every version of clients that received new events, so the previous current version's valid_to is closed.
+SELECT
+  v.* EXCEPT (warn_codes),
+  IFNULL(SPLIT(v.warn_codes, ','), []) AS dq_flags,
+  CURRENT_TIMESTAMP() AS _updated_at
+FROM ${ref("stg_client_profile_versions")} AS v
+${when(incremental(),
+  `WHERE v.client_id IN (
+    SELECT n.client_id
+    FROM ${ref("stg_client_profile_versions")} AS n
+    LEFT JOIN (SELECT client_id, MAX(version_lsn) AS max_lsn FROM ${self()} GROUP BY client_id) AS h
+      ON h.client_id = n.client_id
+    WHERE h.client_id IS NULL OR n.version_lsn > h.max_lsn
+  )`)}

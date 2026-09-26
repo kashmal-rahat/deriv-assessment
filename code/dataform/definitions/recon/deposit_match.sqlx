@@ -1,0 +1,20 @@
+config {
+  type: "operations",
+  schema: "recon",
+  hasOutput: true,
+  tags: ["recon"],
+  description: "Latest match decision per vendor deposit (upserted by client_deposit_apply). Source of the vendor side of deposit_reconciliation."
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  vendor_deposit_id STRING NOT NULL,
+  vendor_source_uri STRING,
+  vendor_file_date DATE,
+  vendor_deposit_date DATE,
+  match_type STRING NOT NULL,
+  wh_source_system STRING,
+  wh_deposit_id STRING,
+  action STRING NOT NULL,
+  decided_at TIMESTAMP NOT NULL
+)
+CLUSTER BY vendor_deposit_id

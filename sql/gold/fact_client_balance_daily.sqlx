@@ -1,0 +1,5 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): fact_client_balance_daily - periodic snapshot, grain: one row per client per calendar day (UTC).
+-- Measure: account_balance_usd as of end of day from silver.client_profile_history (semi-additive: never sum across days).
+-- Stops after deleted_at. Reload of a range rebuilds from range start until each client's next balance change.

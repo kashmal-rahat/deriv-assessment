@@ -1,0 +1,95 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "cdc"],
+  description: "Full profile state after every version: snapshot (version 0) plus CDC events folded in lsn order. An absent key keeps the prior value; an explicit JSON null sets NULL."
+}
+
+js {
+  const cols = cfg.PROFILE_COLUMNS;
+  const present = (jsonCol, c) =>
+    `IF(${helpers.jsonHasKey(jsonCol, c.name)}, STRUCT(${helpers.jsonValue(jsonCol, c.name, c.type)} AS v), NULL)`;
+}
+
+WITH events AS (
+  SELECT
+    client_id,
+    ${cfg.CDC_BASELINE_LSN} AS lsn,
+    TIMESTAMP '1900-01-01 00:00:00+00' AS commit_ts,
+    'snapshot' AS op,
+    source_uri,
+    CAST(NULL AS STRING) AS before_json,
+    after_json
+  FROM ${ref("stg_client_profile_seed")}
+  WHERE record_status = 'VALID'
+
+  UNION ALL
+
+  SELECT client_id, lsn, commit_ts, op, source_uri, before_json, after_json
+  FROM ${ref("stg_cdc_client_profile")}
+  WHERE record_status = 'VALID'
+),
+
+images AS (
+  SELECT
+    e.client_id,
+    e.lsn,
+    e.commit_ts,
+    e.op,
+    e.source_uri,
+    ${cols.map((c) => `${present("aj", c)} AS a_${c.name}`).join(",\n    ")},
+    ${cols.map((c) => `${present("bj", c)} AS b_${c.name}`).join(",\n    ")}
+  FROM events AS e,
+    UNNEST([STRUCT(SAFE.PARSE_JSON(e.after_json) AS aj, SAFE.PARSE_JSON(e.before_json) AS bj)])
+),
+
+folded AS (
+  SELECT
+    client_id,
+    lsn,
+    commit_ts,
+    op,
+    source_uri,
+    LAG(op) OVER by_lsn AS prev_op,
+    LEAD(commit_ts) OVER by_lsn AS next_commit_ts,
+    LAST_VALUE(IF(op IN ('snapshot', 'insert', 'delete'), op, NULL) IGNORE NULLS) OVER upto AS lifecycle_op,
+    LAST_VALUE(IF(op = 'delete', commit_ts, NULL) IGNORE NULLS) OVER upto AS last_delete_ts,
+    LAST_VALUE(IF(op = 'delete', lsn, NULL) IGNORE NULLS) OVER upto AS last_delete_lsn,
+    ${cols.map((c) => `LAST_VALUE(a_${c.name} IGNORE NULLS) OVER upto AS s_${c.name}`).join(",\n    ")},
+    ${cols.map((c) => `LAST_VALUE(a_${c.name} IGNORE NULLS) OVER prior AS p_${c.name}`).join(",\n    ")},
+    ${cols.map((c) => `b_${c.name}`).join(", ")}
+  FROM images
+  WINDOW
+    by_lsn AS (PARTITION BY client_id ORDER BY lsn),
+    upto AS (PARTITION BY client_id ORDER BY lsn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+    prior AS (PARTITION BY client_id ORDER BY lsn ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+),
+
+flagged AS (
+  SELECT
+    *,
+    -- Before image disagrees with the folded prior state for any key both sides know.
+    (${cols.map((c) => `(b_${c.name} IS NOT NULL AND p_${c.name} IS NOT NULL AND b_${c.name}.v IS DISTINCT FROM p_${c.name}.v)`).join("\n      OR ")}) AS has_drift
+  FROM folded
+)
+
+SELECT
+  client_id,
+  lsn AS version_lsn,
+  op,
+  source_uri,
+  commit_ts AS valid_from,
+  next_commit_ts AS valid_to,
+  next_commit_ts IS NULL AS is_current,
+  lifecycle_op = 'delete' AS is_deleted,
+  IF(lifecycle_op = 'delete', last_delete_ts, NULL) AS deleted_at,
+  IF(lifecycle_op = 'delete', last_delete_lsn, NULL) AS deleted_lsn,
+  ${cols.map((c) => `s_${c.name}.v AS ${c.name}`).join(",\n  ")},
+  ${helpers.codes([
+    ["op = 'insert' AND prev_op IS NOT NULL AND prev_op != 'delete'", "CDC_INSERT_ON_EXISTING_KEY"],
+    ["op IN ('update', 'delete') AND prev_op IS NULL", "CDC_CHANGE_WITHOUT_INSERT"],
+    ["op = 'update' AND lifecycle_op = 'delete'", "CDC_UPDATE_AFTER_DELETE"],
+    ["has_drift", "CDC_BEFORE_IMAGE_DRIFT"],
+    [`s_date_of_birth.v < DATE '1900-01-01' OR s_date_of_birth.v > DATE_SUB(${cfg.AS_OF_DATE}, INTERVAL 18 YEAR)`, "IMPLAUSIBLE_DOB"]
+  ])} AS warn_codes
+FROM flagged

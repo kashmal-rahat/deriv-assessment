@@ -1,0 +1,32 @@
+config {
+  type: "incremental",
+  schema: "audit",
+  uniqueKey: ["uri", "generation"],
+  tags: ["audit"],
+  bigquery: { clusterBy: ["feed", "uri"] },
+  description: "One row per landed object version. A re-delivered file with the same name gets a new generation and is_restatement = TRUE.",
+  assertions: { nonNull: ["uri", "generation", "feed"] }
+}
+
+SELECT
+  o.uri,
+  o.generation,
+  o.md5_hash,
+  o.size,
+  o.updated AS object_updated_at,
+  CASE
+    WHEN STARTS_WITH(o.uri, 'gs://${cfg.BUCKET}/vendor/') THEN 'vendor'
+    WHEN STARTS_WITH(o.uri, 'gs://${cfg.BUCKET}/cdc/client_profile/') THEN 'cdc_client_profile'
+    WHEN STARTS_WITH(o.uri, 'gs://${cfg.BUCKET}/seed/') THEN 'seed'
+    ELSE 'unknown'
+  END AS feed,
+  -- Business date comes from the vendor file name; arrival date from the Hive path.
+  SAFE.PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(o.uri, r'_(\d{8})\.[A-Za-z]+$')) AS business_date,
+  SAFE.PARSE_DATE('%Y-%m-%d', REGEXP_EXTRACT(o.uri, r'arrival_date=(\d{4}-\d{2}-\d{2})')) AS arrival_date,
+  ${when(incremental(),
+    `EXISTS (SELECT 1 FROM ${self()} m WHERE m.uri = o.uri AND m.generation != o.generation)`,
+    `FALSE`)} AS is_restatement,
+  CURRENT_TIMESTAMP() AS first_seen_at
+FROM ${ref("landing_objects")} AS o
+${when(incremental(),
+  `WHERE NOT EXISTS (SELECT 1 FROM ${self()} m WHERE m.uri = o.uri AND m.generation = o.generation)`)}

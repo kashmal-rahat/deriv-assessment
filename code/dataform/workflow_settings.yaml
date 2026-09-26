@@ -1,0 +1,11 @@
+# Placeholders only. Real values are injected by scripts/dataform.sh from environment variables
+# (or by a Dataform release configuration in production).
+defaultProject: your-gcp-project
+defaultLocation: US
+defaultDataset: silver
+defaultAssertionDataset: dataform_assertions
+dataformCoreVersion: 3.0.69
+vars:
+  gcs_bucket: your-landing-bucket
+  biglake_connection: your-gcp-project.US.biglake-landing
+  as_of_date: ""

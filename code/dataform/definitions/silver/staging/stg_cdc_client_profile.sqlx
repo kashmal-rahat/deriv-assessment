@@ -1,0 +1,90 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "cdc"],
+  description: "Parsed client_profile CDC events. Identical re-deliveries collapse; two different payloads for one lsn are rejected (LSN_CONFLICT). before/after kept as JSON strings so key presence survives."
+}
+
+WITH parsed AS (
+  SELECT source_uri, arrival_date, TRIM(line) AS raw_line, SAFE.PARSE_JSON(TRIM(line)) AS j
+  FROM ${ref("stg_cdc_lines")}
+  WHERE line IS NOT NULL AND TRIM(line) != ''
+),
+
+typed AS (
+  SELECT
+    source_uri,
+    arrival_date,
+    raw_line,
+    j IS NULL AS is_unparseable,
+    SAFE_CAST(JSON_VALUE(j, '$.lsn') AS INT64) AS lsn,
+    SAFE_CAST(JSON_VALUE(j, '$.commit_ts') AS TIMESTAMP) AS commit_ts,
+    LOWER(JSON_VALUE(j, '$.op')) AS op,
+    UPPER(TRIM(JSON_VALUE(j, '$.client_id'))) AS client_id,
+    IF(JSON_TYPE(JSON_QUERY(j, '$.before')) = 'object', TO_JSON_STRING(JSON_QUERY(j, '$.before')), NULL) AS before_json,
+    IF(JSON_TYPE(JSON_QUERY(j, '$.after')) = 'object', TO_JSON_STRING(JSON_QUERY(j, '$.after')), NULL) AS after_json,
+    COALESCE(TO_JSON_STRING(j), raw_line) AS event_fingerprint
+  FROM parsed
+),
+
+deduped AS (
+  SELECT
+    event_fingerprint,
+    ANY_VALUE(source_uri) AS source_uri,
+    MIN(arrival_date) AS arrival_date,
+    ANY_VALUE(raw_line) AS raw_line,
+    ANY_VALUE(is_unparseable) AS is_unparseable,
+    ANY_VALUE(lsn) AS lsn,
+    ANY_VALUE(commit_ts) AS commit_ts,
+    ANY_VALUE(op) AS op,
+    ANY_VALUE(client_id) AS client_id,
+    ANY_VALUE(before_json) AS before_json,
+    ANY_VALUE(after_json) AS after_json,
+    COUNT(*) AS copies
+  FROM typed
+  GROUP BY event_fingerprint
+),
+
+with_lsn_payloads AS (
+  SELECT *, COUNT(*) OVER (PARTITION BY lsn) AS lsn_payloads
+  FROM deduped
+),
+
+checked AS (
+  SELECT
+    d.*,
+    ${helpers.codes([
+      ["d.is_unparseable", "UNPARSEABLE_JSON"],
+      ["NOT d.is_unparseable AND d.lsn IS NULL", "MISSING_LSN"],
+      ["NOT d.is_unparseable AND d.commit_ts IS NULL", "INVALID_COMMIT_TS"],
+      ["NOT d.is_unparseable AND (d.op IS NULL OR d.op NOT IN ('insert', 'update', 'delete'))", "UNKNOWN_OP"],
+      ["NOT d.is_unparseable AND d.client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["d.op IN ('insert', 'update') AND d.after_json IS NULL", "MISSING_AFTER_IMAGE"],
+      ["d.lsn IS NOT NULL AND d.lsn_payloads > 1", "LSN_CONFLICT"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      ["d.copies > 1", "DUPLICATE_EVENT"],
+      [`d.lsn <= ${cfg.CDC_BASELINE_LSN}`, "LSN_AT_OR_BEFORE_SNAPSHOT"]
+    ])} AS warn_codes
+  FROM with_lsn_payloads AS d
+)
+
+SELECT
+  source_uri,
+  arrival_date,
+  raw_line,
+  lsn,
+  commit_ts,
+  op,
+  client_id,
+  before_json,
+  after_json,
+  copies,
+  error_codes,
+  warn_codes,
+  CASE
+    WHEN error_codes IS NOT NULL THEN 'REJECTED'
+    WHEN lsn <= ${cfg.CDC_BASELINE_LSN} THEN 'SUPERSEDED_BY_SNAPSHOT'
+    ELSE 'VALID'
+  END AS record_status
+FROM checked

@@ -1,0 +1,37 @@
+config {
+  type: "operations",
+  schema: "quarantine",
+  hasOutput: true,
+  tags: ["quality"],
+  dependencies: ["client_deposit_apply"],
+  description: "Rows that failed an ERROR rule, with the raw payload and reason codes. Never loaded into silver. Insert-only on a deterministic record_id, so reruns do not duplicate."
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  record_id STRING NOT NULL,
+  entity STRING NOT NULL,
+  record_key STRING,
+  source_uri STRING,
+  raw_payload STRING,
+  error_codes ARRAY<STRING> NOT NULL,
+  first_seen_at TIMESTAMP NOT NULL
+)
+PARTITION BY DATE(first_seen_at)
+CLUSTER BY entity;
+
+MERGE ${self()} AS t
+USING (
+  ${cfg.STAGING_SOURCES.map((s) => `
+  SELECT
+    TO_HEX(SHA256(CONCAT('${s.entity}', '|', IFNULL(source_uri, ''), '|', IFNULL(${s.payload}, '')))) AS record_id,
+    '${s.entity}' AS entity,
+    ${s.key} AS record_key,
+    source_uri,
+    ${s.payload} AS raw_payload,
+    SPLIT(error_codes, ',') AS error_codes
+  FROM ${ref(s.view)}
+  WHERE record_status = 'REJECTED'`).join("\n  UNION ALL")}
+) AS s
+ON t.record_id = s.record_id
+WHEN NOT MATCHED THEN INSERT (record_id, entity, record_key, source_uri, raw_payload, error_codes, first_seen_at)
+VALUES (s.record_id, s.entity, s.record_key, s.source_uri, s.raw_payload, s.error_codes, CURRENT_TIMESTAMP());

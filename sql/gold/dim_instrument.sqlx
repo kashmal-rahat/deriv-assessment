@@ -1,0 +1,4 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): dim_instrument - SCD1, one row per instrument (EUR/USD, Gold, BTC/USD, S&P500, USD/JPY).
+-- Attributes: asset_class (fx, metal, crypto, index), base/quote currency. Unknown instruments get an inferred member.

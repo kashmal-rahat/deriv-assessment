@@ -1,0 +1,47 @@
+config {
+  type: "operations",
+  schema: "silver",
+  hasOutput: true,
+  tags: ["core", "deposit"],
+  description: "Target deposit table. Merge key (source_system, deposit_id): INTERNAL rows come from the warehouse seed, VENDOR rows are vendor-only deposits. Seed rows are insert-only so later vendor corrections are never reverted. Vendor changes are applied by client_deposit_apply."
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  source_system STRING NOT NULL,
+  deposit_id STRING NOT NULL,
+  client_id STRING NOT NULL,
+  deposit_date DATE NOT NULL,
+  amount_usd NUMERIC NOT NULL,
+  payment_method STRING,
+  currency_original STRING,
+  exchange_rate NUMERIC,
+  status STRING,
+  processing_days INT64,
+  fee_usd NUMERIC,
+  vendor_deposit_id STRING,
+  last_vendor_file STRING,
+  vendor_file_date DATE,
+  recon_status STRING,
+  dq_flags ARRAY<STRING>,
+  _created_at TIMESTAMP NOT NULL,
+  _updated_at TIMESTAMP NOT NULL
+)
+PARTITION BY deposit_date
+CLUSTER BY client_id, source_system, deposit_id
+OPTIONS (description = 'Deposits: INTERNAL (warehouse) and VENDOR (vendor-only) rows, vendor has priority on operational fields.');
+
+MERGE ${self()} AS t
+USING (
+  SELECT *
+  FROM ${ref("stg_client_deposit_seed")}
+  WHERE record_status = 'VALID'
+) AS s
+ON t.source_system = 'INTERNAL' AND t.deposit_id = s.deposit_id
+WHEN NOT MATCHED THEN INSERT (
+  source_system, deposit_id, client_id, deposit_date, amount_usd, payment_method, currency_original,
+  exchange_rate, status, processing_days, fee_usd, recon_status, dq_flags, _created_at, _updated_at
+) VALUES (
+  'INTERNAL', s.deposit_id, s.client_id, s.deposit_date, s.amount_usd, s.payment_method, s.currency_original,
+  s.exchange_rate, s.status, s.processing_days, s.fee_usd, 'UNRECONCILED',
+  IFNULL(SPLIT(s.warn_codes, ','), []), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+);

@@ -1,0 +1,13 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "cdc"],
+  description: "CDC raw lines with their source file. Not windowed: the profile fold needs the full event history because update images are partial."
+}
+
+SELECT
+  _FILE_NAME AS source_uri,
+  arrival_date,
+  line
+FROM ${ref("cdc_client_profile_raw")}
+WHERE arrival_date <= ${cfg.AS_OF_DATE}

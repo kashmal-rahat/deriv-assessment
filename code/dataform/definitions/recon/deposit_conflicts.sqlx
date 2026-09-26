@@ -1,0 +1,24 @@
+config {
+  type: "operations",
+  schema: "recon",
+  hasOutput: true,
+  tags: ["recon"],
+  description: "Every vendor-driven change or refusal on client_deposit, with vendor and prior warehouse values side by side. Insert-only, keyed by a deterministic conflict_id. resolution_status: APPLIED, OPEN (blocked, needs review), IGNORED (stale vendor record)."
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  conflict_id STRING NOT NULL,
+  detected_at TIMESTAMP NOT NULL,
+  vendor_deposit_id STRING NOT NULL,
+  vendor_source_uri STRING,
+  vendor_file_date DATE,
+  match_type STRING,
+  wh_source_system STRING,
+  wh_deposit_id STRING,
+  action STRING NOT NULL,
+  resolution_status STRING NOT NULL,
+  vendor_values JSON,
+  warehouse_values_before JSON
+)
+PARTITION BY DATE(detected_at)
+CLUSTER BY resolution_status, vendor_deposit_id

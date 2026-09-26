@@ -1,0 +1,4 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2, optional): fact_deposit_reconciliation_daily - periodic snapshot of recon.deposit_reconciliation,
+-- grain: one row per recon_key per as_of_date. Measures: amount, break counts by recon_status. For trending open breaks.

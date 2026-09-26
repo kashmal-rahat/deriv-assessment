@@ -1,0 +1,7 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): fact_deposit - grain: one row per deposit (source_system, deposit_id) from silver.client_deposit.
+-- Measures: amount_usd, fee_usd, exchange_rate, processing_days.
+-- FKs: client_sk (as-of lookup on deposit_date; fallback to earliest version + dim_lookup_fallback flag),
+--      deposit_date_key, payment_method_key, currency_key, deposit_junk_key. Also keeps durable client_id.
+-- Load: partition overwrite of affected deposit_date partitions. Partition by deposit_date, cluster by client_id.

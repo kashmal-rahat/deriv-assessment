@@ -1,0 +1,41 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  uniqueKey: ["deposit_id"],
+  tags: ["core", "vendor"],
+  bigquery: { partitionBy: "deposit_date", clusterBy: ["client_id", "deposit_id"] },
+  description: "Latest valid vendor view of each vendor deposit. Precedence: vendor file business date, then arrival date, then GCS generation. An older (late) file never overwrites a newer one.",
+  assertions: { uniqueKey: ["deposit_id"] }
+}
+
+js {
+  const bizCols = ["deposit_id", "client_id", "deposit_date", "amount_usd", "payment_method",
+    "currency_original", "exchange_rate", "status", "processing_days", "fee_usd"];
+}
+
+WITH ranked AS (
+  SELECT
+    ${bizCols.join(",\n    ")},
+    ${helpers.rowHash(bizCols)} AS row_hash,
+    COALESCE(vendor_file_date, arrival_date) AS vendor_file_date,
+    arrival_date,
+    generation,
+    source_uri,
+    IFNULL(SPLIT(warn_codes, ','), []) AS dq_flags,
+    CURRENT_TIMESTAMP() AS _updated_at
+  FROM ${ref("stg_vendor_deposit")}
+  WHERE record_status = 'VALID'
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY deposit_id
+    ORDER BY COALESCE(vendor_file_date, arrival_date) DESC, arrival_date DESC, generation DESC, ${helpers.rowHash(bizCols)}
+  ) = 1
+)
+
+SELECT *
+FROM ranked AS r
+${when(incremental(),
+  `WHERE NOT EXISTS (
+    SELECT 1 FROM ${self()} AS t
+    WHERE t.deposit_id = r.deposit_id
+      AND (t.row_hash = r.row_hash OR t.vendor_file_date > r.vendor_file_date)
+  )`)}

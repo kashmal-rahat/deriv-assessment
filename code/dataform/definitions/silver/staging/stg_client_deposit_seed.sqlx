@@ -1,0 +1,80 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "seed", "deposit"],
+  description: "Typed and validated client_deposit seed rows (internal system of record)."
+}
+
+js {
+  const known = cfg.VENDOR_COLUMNS;
+}
+
+WITH typed AS (
+  SELECT
+    source_uri,
+    raw_payload,
+    j IS NULL AS is_unparseable,
+    UPPER(${helpers.jsonValue("j", "deposit_id", "STRING")}) AS deposit_id,
+    UPPER(${helpers.jsonValue("j", "client_id", "STRING")}) AS client_id,
+    ${helpers.jsonValue("j", "deposit_date", "DATE")} AS deposit_date,
+    ${helpers.jsonValue("j", "amount_usd", "NUMERIC")} AS amount_usd,
+    LOWER(${helpers.jsonValue("j", "payment_method", "STRING")}) AS payment_method,
+    UPPER(${helpers.jsonValue("j", "currency_original", "STRING")}) AS currency_original,
+    ${helpers.jsonValue("j", "exchange_rate", "NUMERIC")} AS exchange_rate,
+    LOWER(${helpers.jsonValue("j", "status", "STRING")}) AS status,
+    ${helpers.jsonValue("j", "processing_days", "INT64")} AS processing_days,
+    ${helpers.jsonValue("j", "fee_usd", "NUMERIC")} AS fee_usd,
+    NULLIF(ARRAY_TO_STRING(ARRAY(
+      SELECT k FROM UNNEST(JSON_KEYS(j, 1)) AS k WHERE k NOT IN (${helpers.sqlList(known)}) ORDER BY k
+    ), ','), '') AS unmapped_keys
+  FROM ${ref("stg_seed_client_deposit_json")}
+),
+
+checked AS (
+  SELECT
+    t.*,
+    ${helpers.codes([
+      ["t.is_unparseable", "UNPARSEABLE_JSON"],
+      ["NOT t.is_unparseable AND t.deposit_id IS NULL", "MISSING_DEPOSIT_ID"],
+      ["NOT t.is_unparseable AND t.client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["NOT t.is_unparseable AND t.deposit_date IS NULL", "INVALID_DEPOSIT_DATE"],
+      ["NOT t.is_unparseable AND t.amount_usd IS NULL", "INVALID_AMOUNT"],
+      ["t.amount_usd <= 0", "NON_POSITIVE_AMOUNT"],
+      ["NOT t.is_unparseable AND t.payment_method IS NULL", "MISSING_PAYMENT_METHOD"],
+      ["t.payment_method NOT IN (" + helpers.sqlList(cfg.PAYMENT_METHODS) + ")", "UNKNOWN_PAYMENT_METHOD"],
+      ["NOT t.is_unparseable AND (t.currency_original IS NULL OR NOT REGEXP_CONTAINS(t.currency_original, r'^[A-Z]{3}$'))", "INVALID_CURRENCY"],
+      ["NOT t.is_unparseable AND (t.exchange_rate IS NULL OR t.exchange_rate <= 0)", "INVALID_EXCHANGE_RATE"],
+      ["NOT t.is_unparseable AND (t.status IS NULL OR t.status NOT IN (" + helpers.sqlList(cfg.DEPOSIT_STATUSES) + "))", "UNKNOWN_STATUS"],
+      ["t.fee_usd < 0", "NEGATIVE_FEE"],
+      ["t.deposit_id IS NOT NULL AND t.key_rows > 1", "DUPLICATE_DEPOSIT_ID"],
+      ["t.client_id IS NOT NULL AND s.client_id IS NULL", "ORPHAN_CLIENT"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      ["t.deposit_date < s.signup_date", "DEPOSIT_BEFORE_SIGNUP"],
+      ["s.kyc_status != 'approved'", "KYC_NOT_APPROVED"],
+      ["t.currency_original = 'USD' AND t.exchange_rate != 1", "USD_RATE_NOT_ONE"],
+      ["t.fee_usd > t.amount_usd", "FEE_EXCEEDS_AMOUNT"],
+      ["t.unmapped_keys IS NOT NULL", "UNMAPPED_KEYS"]
+    ])} AS warn_codes
+  FROM (SELECT *, COUNT(*) OVER (PARTITION BY deposit_id) AS key_rows FROM typed) AS t
+  LEFT JOIN ${ref("client_signup")} AS s ON s.client_id = t.client_id
+)
+
+SELECT
+  source_uri,
+  raw_payload,
+  deposit_id,
+  client_id,
+  deposit_date,
+  amount_usd,
+  payment_method,
+  currency_original,
+  exchange_rate,
+  status,
+  processing_days,
+  fee_usd,
+  unmapped_keys,
+  error_codes,
+  warn_codes,
+  IF(error_codes IS NULL, 'VALID', 'REJECTED') AS record_status
+FROM checked

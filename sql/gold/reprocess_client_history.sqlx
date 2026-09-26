@@ -1,0 +1,8 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold", "reprocess"] }
+
+-- TODO (Part 2): reprocess a historical range (vars reprocess_from / reprocess_to, e.g. November 2024).
+-- 1. Table snapshot of dim_client / client_profile_history before running.
+-- 2. Scope = clients with CDC events whose commit_ts falls in the range; recompute each one's FULL version chain (snapshot + all events).
+-- 3. One transaction: delete those clients' versions, insert the recomputed chain (deterministic keys, so no duplicates).
+-- 4. Partition-overwrite the facts for the range; balance snapshot rebuilt until the next change.
+-- 5. Assert: one current version per client, no overlapping validity ranges, row counts match.

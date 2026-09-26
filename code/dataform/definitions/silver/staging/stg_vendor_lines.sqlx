@@ -1,0 +1,13 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "vendor"],
+  description: "Vendor raw lines with their source file, limited to the arrival-date lookback window. Late back-dated files always land in a recent arrival partition."
+}
+
+SELECT
+  _FILE_NAME AS source_uri,
+  arrival_date,
+  line
+FROM ${ref("vendor_deposits_raw")}
+WHERE arrival_date BETWEEN DATE_SUB(${cfg.AS_OF_DATE}, INTERVAL ${cfg.LOOKBACK_DAYS} DAY) AND ${cfg.AS_OF_DATE}

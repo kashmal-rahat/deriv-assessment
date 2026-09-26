@@ -1,0 +1,30 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  uniqueKey: ["trade_id"],
+  tags: ["core"],
+  bigquery: { partitionBy: "trade_date", clusterBy: ["client_id"] },
+  description: "One row per trade. MERGE on trade_id; unchanged rows skipped. WARN rules recorded in dq_flags.",
+  assertions: { uniqueKey: ["trade_id"], nonNull: ["trade_id", "client_id", "trade_date"] }
+}
+
+js {
+  const bizCols = ["trade_id", "client_id", "trade_date", "instrument", "direction", "volume_lots",
+    "open_price", "close_price", "pnl_usd", "trade_status"];
+}
+
+WITH src AS (
+  SELECT
+    ${bizCols.join(",\n    ")},
+    ${helpers.rowHash(bizCols)} AS row_hash,
+    IFNULL(SPLIT(warn_codes, ','), []) AS dq_flags,
+    source_uri AS _source_uri,
+    CURRENT_TIMESTAMP() AS _updated_at
+  FROM ${ref("stg_client_trades")}
+  WHERE record_status = 'VALID'
+)
+
+SELECT *
+FROM src
+${when(incremental(),
+  `WHERE NOT EXISTS (SELECT 1 FROM ${self()} AS t WHERE t.trade_id = src.trade_id AND t.row_hash = src.row_hash)`)}

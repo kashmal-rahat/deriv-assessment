@@ -1,0 +1,18 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "recon"],
+  description: "Business dates whose reconciliation must be rebuilt this run: dates touched by recently arrived vendor rows (including back-dated late files) plus the rolling lookback window (drives PENDING -> MISSING_IN_VENDOR)."
+}
+
+SELECT DISTINCT deposit_date
+FROM (
+  SELECT vendor_deposit_date AS deposit_date
+  FROM ${ref("stg_deposit_match")}
+
+  UNION ALL
+
+  SELECT d AS deposit_date
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(${cfg.AS_OF_DATE}, INTERVAL ${cfg.LOOKBACK_DAYS} DAY), ${cfg.AS_OF_DATE})) AS d
+)
+WHERE deposit_date IS NOT NULL

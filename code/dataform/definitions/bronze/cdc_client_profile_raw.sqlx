@@ -1,0 +1,15 @@
+config {
+  type: "operations",
+  schema: "bronze",
+  hasOutput: true,
+  tags: ["bronze"],
+  description: "client_profile CDC JSONL as raw lines, Hive-partitioned by arrival_date. Parsed with SAFE.PARSE_JSON in silver_staging so key presence is preserved."
+}
+
+CREATE OR REPLACE EXTERNAL TABLE ${self()}
+${helpers.rawLineTableDdl({
+  connection: cfg.CONNECTION,
+  uriPrefix: `gs://${cfg.BUCKET}/cdc/client_profile`,
+  hivePartitioned: true,
+  delimiter: cfg.RAW_LINE_DELIMITER
+})}

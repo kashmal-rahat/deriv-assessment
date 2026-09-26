@@ -1,0 +1,10 @@
+config {
+  type: "view",
+  schema: "silver",
+  tags: ["core", "cdc"],
+  description: "Consumer-facing profile view: excludes soft-deleted clients."
+}
+
+SELECT * EXCEPT (is_deleted, deleted_at, deleted_lsn)
+FROM ${ref("client_profile")}
+WHERE NOT is_deleted

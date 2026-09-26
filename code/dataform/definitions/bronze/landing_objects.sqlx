@@ -1,0 +1,14 @@
+config {
+  type: "operations",
+  schema: "bronze",
+  hasOutput: true,
+  tags: ["bronze"],
+  description: "BigLake object table listing every landed object (uri, generation, md5_hash, size). Feeds audit.file_manifest."
+}
+
+CREATE OR REPLACE EXTERNAL TABLE ${self()}
+WITH CONNECTION `${cfg.CONNECTION}`
+OPTIONS (
+  object_metadata = 'SIMPLE',
+  uris = ['gs://${cfg.BUCKET}/*']
+)

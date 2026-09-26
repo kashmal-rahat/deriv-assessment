@@ -1,0 +1,5 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): fact_trade - grain: one row per trade (trade_id) from silver.client_trades.
+-- Measures: volume_lots, open_price, close_price, pnl_usd (additive). FKs: client_sk (as-of trade_date), trade_date_key,
+-- instrument_key, trade_junk_key; keeps durable client_id. Partition by trade_date, cluster by client_id, instrument_key.

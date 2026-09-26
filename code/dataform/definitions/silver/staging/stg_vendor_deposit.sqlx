@@ -1,0 +1,187 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "vendor"],
+  description: "Vendor deposit rows mapped by header name, typed and validated. record_status: VALID, ORPHAN_PENDING (client unknown, within grace) or REJECTED (error_codes set)."
+}
+
+js {
+  const alias = (expr) => helpers.aliasCase(expr, cfg.VENDOR_COLUMN_ALIASES);
+  // Value of canonical column `col` in data line d, located by the file's own header.
+  const field = (col) => `(
+      SELECT NULLIF(TRIM(v), '')
+      FROM UNNEST(SPLIT(d.line, ',')) AS v WITH OFFSET o
+      JOIN UNNEST(f.header_cols) AS hc WITH OFFSET ho ON ho = o
+      WHERE hc = '${col}'
+      LIMIT 1)`;
+  const businessCols = ["deposit_id", "client_id", "deposit_date", "amount_usd", "payment_method",
+    "currency_original", "exchange_rate", "status", "processing_days", "fee_usd"];
+}
+
+WITH lines AS (
+  SELECT source_uri, arrival_date, TRIM(line) AS line
+  FROM ${ref("stg_vendor_lines")}
+  WHERE line IS NOT NULL AND TRIM(line) != ''
+),
+
+headers AS (
+  SELECT source_uri, ANY_VALUE(line) AS header_line, COUNT(*) AS header_count
+  FROM lines
+  WHERE ${alias("LOWER(TRIM(SPLIT(line, ',')[SAFE_OFFSET(0)]))")} = 'deposit_id'
+  GROUP BY source_uri
+),
+
+file_checks AS (
+  SELECT
+    h.source_uri,
+    h.header_line,
+    h.header_count,
+    hc.header_cols,
+    ARRAY_TO_STRING(ARRAY(
+      SELECT r FROM UNNEST([${helpers.sqlList(cfg.VENDOR_REQUIRED_COLUMNS)}]) AS r
+      WHERE r NOT IN UNNEST(hc.header_cols)
+      ORDER BY r
+    ), ',') AS missing_required_columns
+  FROM headers AS h,
+    UNNEST([STRUCT(ARRAY(
+      SELECT ${alias("LOWER(TRIM(x))")} FROM UNNEST(SPLIT(h.header_line, ',')) AS x WITH OFFSET o ORDER BY o
+    ) AS header_cols)]) AS hc
+),
+
+manifest_latest AS (
+  SELECT uri, generation, business_date
+  FROM ${ref("file_manifest")}
+  WHERE feed = 'vendor'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY uri ORDER BY generation DESC) = 1
+),
+
+-- Exact duplicate lines within a file collapse to one row; line_copies records how many there were.
+data_lines AS (
+  SELECT l.source_uri, ANY_VALUE(l.arrival_date) AS arrival_date, l.line, COUNT(*) AS line_copies
+  FROM lines AS l
+  LEFT JOIN headers AS h ON h.source_uri = l.source_uri AND h.header_line = l.line
+  WHERE h.source_uri IS NULL
+  GROUP BY l.source_uri, l.line
+),
+
+mapped AS (
+  SELECT
+    d.source_uri,
+    d.arrival_date,
+    d.line AS raw_line,
+    d.line_copies,
+    f.header_count,
+    f.missing_required_columns,
+    ARRAY_LENGTH(SPLIT(d.line, ',')) AS field_count,
+    ARRAY_LENGTH(f.header_cols) AS header_field_count,
+    ${cfg.VENDOR_COLUMNS.map((c) => `${field(c)} AS ${c}_raw`).join(",\n    ")},
+    (
+      SELECT IF(COUNT(*) = 0, NULL,
+        TO_JSON_STRING(JSON_OBJECT(ARRAY_AGG(hc ORDER BY o), ARRAY_AGG(TRIM(v) ORDER BY o))))
+      FROM UNNEST(SPLIT(d.line, ',')) AS v WITH OFFSET o
+      JOIN UNNEST(f.header_cols) AS hc WITH OFFSET ho ON ho = o
+      WHERE hc NOT IN (${helpers.sqlList(cfg.VENDOR_COLUMNS)})
+    ) AS extra_columns
+  FROM data_lines AS d
+  LEFT JOIN file_checks AS f USING (source_uri)
+),
+
+typed AS (
+  SELECT
+    m.*,
+    mf.generation,
+    mf.business_date AS vendor_file_date,
+    UPPER(m.deposit_id_raw) AS deposit_id,
+    UPPER(m.client_id_raw) AS client_id,
+    SAFE.PARSE_DATE('%Y-%m-%d', m.deposit_date_raw) AS deposit_date,
+    SAFE_CAST(m.amount_usd_raw AS NUMERIC) AS amount_usd,
+    LOWER(m.payment_method_raw) AS payment_method,
+    UPPER(m.currency_original_raw) AS currency_original,
+    SAFE_CAST(m.exchange_rate_raw AS NUMERIC) AS exchange_rate,
+    LOWER(m.status_raw) AS status,
+    SAFE_CAST(m.processing_days_raw AS INT64) AS processing_days,
+    SAFE_CAST(m.fee_usd_raw AS NUMERIC) AS fee_usd
+  FROM mapped AS m
+  LEFT JOIN manifest_latest AS mf ON mf.uri = m.source_uri
+),
+
+checked AS (
+  SELECT
+    t.*,
+    s.client_id IS NOT NULL AS client_known,
+    TO_JSON_STRING(STRUCT(${businessCols.map((c) => `t.${c}`).join(", ")})) AS business_fingerprint,
+    ${helpers.codes([
+      ["t.header_count IS NULL", "FILE_HEADER_NOT_FOUND"],
+      ["t.header_count > 1", "FILE_MULTIPLE_HEADERS"],
+      ["t.missing_required_columns != ''", "FILE_MISSING_REQUIRED_COLUMN"],
+      ["t.field_count != t.header_field_count", "FIELD_COUNT_MISMATCH"],
+      ["t.deposit_id IS NULL", "MISSING_DEPOSIT_ID"],
+      ["t.client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["t.deposit_date IS NULL", "INVALID_DEPOSIT_DATE"],
+      ["t.amount_usd IS NULL", "INVALID_AMOUNT"],
+      ["t.amount_usd <= 0", "NON_POSITIVE_AMOUNT"],
+      ["t.payment_method IS NULL OR t.payment_method NOT IN (" + helpers.sqlList(cfg.PAYMENT_METHODS) + ")", "UNKNOWN_PAYMENT_METHOD"],
+      ["t.currency_original IS NULL OR NOT REGEXP_CONTAINS(t.currency_original, r'^[A-Z]{3}$')", "INVALID_CURRENCY"],
+      ["t.exchange_rate IS NULL OR t.exchange_rate <= 0", "INVALID_EXCHANGE_RATE"],
+      ["t.status IS NULL OR t.status NOT IN (" + helpers.sqlList(cfg.DEPOSIT_STATUSES) + ")", "UNKNOWN_STATUS"],
+      ["t.fee_usd_raw IS NOT NULL AND t.fee_usd IS NULL", "INVALID_FEE"],
+      ["t.fee_usd < 0", "NEGATIVE_FEE"],
+      ["t.processing_days_raw IS NOT NULL AND t.processing_days IS NULL", "INVALID_PROCESSING_DAYS"],
+      ["t.processing_days < 0", "NEGATIVE_PROCESSING_DAYS"],
+      ["t.deposit_date > COALESCE(t.vendor_file_date, t.arrival_date)", "FUTURE_DATED"],
+      [`s.client_id IS NULL AND DATE_DIFF(${cfg.AS_OF_DATE}, t.arrival_date, DAY) > ${cfg.GRACE_DAYS}`, "ORPHAN_CLIENT"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      ["t.deposit_date < s.signup_date", "DEPOSIT_BEFORE_SIGNUP"],
+      ["s.kyc_status != 'approved'", "KYC_NOT_APPROVED"],
+      ["p.is_deleted", "CLIENT_DELETED"],
+      ["t.currency_original = 'USD' AND t.exchange_rate != 1", "USD_RATE_NOT_ONE"],
+      ["t.fee_usd > t.amount_usd", "FEE_EXCEEDS_AMOUNT"],
+      ["t.line_copies > 1", "DUPLICATE_LINE_IN_FILE"],
+      ["t.extra_columns IS NOT NULL", "UNMAPPED_COLUMNS"],
+      [`s.client_id IS NULL AND DATE_DIFF(${cfg.AS_OF_DATE}, t.arrival_date, DAY) <= ${cfg.GRACE_DAYS}`, "ORPHAN_PENDING"]
+    ])} AS base_warn_codes
+  FROM typed AS t
+  LEFT JOIN ${ref("client_signup")} AS s ON s.client_id = t.client_id
+  LEFT JOIN ${ref("client_profile")} AS p ON p.client_id = t.client_id
+),
+
+-- Same deposit_id with different business values across valid rows = vendor restated the record.
+restatements AS (
+  SELECT
+    *,
+    error_codes IS NULL
+      AND MIN(business_fingerprint) OVER (PARTITION BY deposit_id, error_codes IS NULL)
+        != MAX(business_fingerprint) OVER (PARTITION BY deposit_id, error_codes IS NULL) AS is_restated
+  FROM checked
+)
+
+SELECT
+  source_uri,
+  generation,
+  arrival_date,
+  vendor_file_date,
+  raw_line,
+  line_copies,
+  deposit_id,
+  client_id,
+  deposit_date,
+  amount_usd,
+  payment_method,
+  currency_original,
+  exchange_rate,
+  status,
+  processing_days,
+  fee_usd,
+  extra_columns,
+  error_codes,
+  ${helpers.concatCodes(
+    "base_warn_codes",
+    "IF(is_restated, 'VENDOR_RESTATEMENT', NULL)"
+  )} AS warn_codes,
+  CASE
+    WHEN error_codes IS NOT NULL THEN 'REJECTED'
+    WHEN NOT client_known THEN 'ORPHAN_PENDING'
+    ELSE 'VALID'
+  END AS record_status
+FROM restatements

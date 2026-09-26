@@ -1,0 +1,30 @@
+config {
+  type: "incremental",
+  schema: "silver",
+  uniqueKey: ["client_id"],
+  tags: ["core"],
+  bigquery: { clusterBy: ["client_id"] },
+  description: "One row per client (root entity). MERGE on client_id; unchanged rows (same row_hash) are skipped.",
+  assertions: { uniqueKey: ["client_id"], nonNull: ["client_id", "signup_date"] }
+}
+
+js {
+  const bizCols = ["client_id", "signup_date", "country", "email", "kyc_status", "account_type",
+    "referral_source", "signup_platform", "promo_code", "assigned_manager"];
+}
+
+WITH src AS (
+  SELECT
+    ${bizCols.join(",\n    ")},
+    ${helpers.rowHash(bizCols)} AS row_hash,
+    IFNULL(SPLIT(warn_codes, ','), []) AS dq_flags,
+    source_uri AS _source_uri,
+    CURRENT_TIMESTAMP() AS _updated_at
+  FROM ${ref("stg_client_signup")}
+  WHERE record_status = 'VALID'
+)
+
+SELECT *
+FROM src
+${when(incremental(),
+  `WHERE NOT EXISTS (SELECT 1 FROM ${self()} AS t WHERE t.client_id = src.client_id AND t.row_hash = src.row_hash)`)}

@@ -1,0 +1,4 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): dim_deposit_junk - junk dimension: all combinations of deposit status, source_system (INTERNAL/VENDOR)
+-- and recon_status. Key = FARM_FINGERPRINT of the combination.

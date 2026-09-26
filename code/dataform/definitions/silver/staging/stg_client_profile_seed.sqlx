@@ -1,0 +1,50 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "seed", "cdc"],
+  description: "client_profile snapshot rows. Becomes version 0 (lsn = cdc_baseline_lsn) of every profile in the CDC fold."
+}
+
+js {
+  const known = ["client_id"].concat(cfg.PROFILE_COLUMNS.map((c) => c.name));
+}
+
+WITH typed AS (
+  SELECT
+    source_uri,
+    raw_payload,
+    j IS NULL AS is_unparseable,
+    UPPER(${helpers.jsonValue("j", "client_id", "STRING")}) AS client_id,
+    TO_JSON_STRING(j) AS after_json,
+    NULLIF(ARRAY_TO_STRING(ARRAY(
+      SELECT k FROM UNNEST(JSON_KEYS(j, 1)) AS k WHERE k NOT IN (${helpers.sqlList(known)}) ORDER BY k
+    ), ','), '') AS unmapped_keys
+  FROM ${ref("stg_seed_client_profile_json")}
+),
+
+checked AS (
+  SELECT
+    t.*,
+    ${helpers.codes([
+      ["t.is_unparseable", "UNPARSEABLE_JSON"],
+      ["NOT t.is_unparseable AND t.client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["t.client_id IS NOT NULL AND t.key_rows > 1", "DUPLICATE_CLIENT_ID"],
+      ["t.client_id IS NOT NULL AND s.client_id IS NULL", "ORPHAN_CLIENT"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      ["t.unmapped_keys IS NOT NULL", "UNMAPPED_KEYS"]
+    ])} AS warn_codes
+  FROM (SELECT *, COUNT(*) OVER (PARTITION BY client_id) AS key_rows FROM typed) AS t
+  LEFT JOIN ${ref("client_signup")} AS s ON s.client_id = t.client_id
+)
+
+SELECT
+  source_uri,
+  raw_payload,
+  client_id,
+  after_json,
+  unmapped_keys,
+  error_codes,
+  warn_codes,
+  IF(error_codes IS NULL, 'VALID', 'REJECTED') AS record_status
+FROM checked

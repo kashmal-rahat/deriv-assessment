@@ -1,0 +1,4 @@
+config { type: "operations", schema: "gold", disabled: true, tags: ["gold"] }
+
+-- TODO (Part 2): dim_date - generated calendar (GENERATE_DATE_ARRAY), date_key = YYYYMMDD INT64.
+-- Attributes: day, week, month, quarter, year, is_weekend, is_month_end. Includes a -1 'Unknown' member.

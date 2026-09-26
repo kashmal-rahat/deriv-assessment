@@ -1,0 +1,75 @@
+config {
+  type: "view",
+  schema: "silver_staging",
+  tags: ["staging", "seed"],
+  description: "Typed and validated client_signup rows from the seed."
+}
+
+js {
+  const known = ["client_id", "signup_date", "country", "email", "kyc_status", "account_type",
+    "referral_source", "signup_platform", "promo_code", "assigned_manager"];
+}
+
+WITH typed AS (
+  SELECT
+    source_uri,
+    raw_payload,
+    j IS NULL AS is_unparseable,
+    UPPER(${helpers.jsonValue("j", "client_id", "STRING")}) AS client_id,
+    ${helpers.jsonValue("j", "signup_date", "DATE")} AS signup_date,
+    ${helpers.jsonValue("j", "signup_date", "STRING")} AS signup_date_raw,
+    ${helpers.jsonValue("j", "country", "STRING")} AS country,
+    LOWER(${helpers.jsonValue("j", "email", "STRING")}) AS email,
+    LOWER(${helpers.jsonValue("j", "kyc_status", "STRING")}) AS kyc_status,
+    LOWER(${helpers.jsonValue("j", "account_type", "STRING")}) AS account_type,
+    LOWER(${helpers.jsonValue("j", "referral_source", "STRING")}) AS referral_source,
+    LOWER(${helpers.jsonValue("j", "signup_platform", "STRING")}) AS signup_platform,
+    ${helpers.jsonValue("j", "promo_code", "STRING")} AS promo_code,
+    ${helpers.jsonValue("j", "assigned_manager", "STRING")} AS assigned_manager,
+    NULLIF(ARRAY_TO_STRING(ARRAY(
+      SELECT k FROM UNNEST(JSON_KEYS(j, 1)) AS k WHERE k NOT IN (${helpers.sqlList(known)}) ORDER BY k
+    ), ','), '') AS unmapped_keys
+  FROM ${ref("stg_seed_client_signup_json")}
+),
+
+counted AS (
+  SELECT *, COUNT(*) OVER (PARTITION BY client_id) AS key_rows
+  FROM typed
+),
+
+checked AS (
+  SELECT
+    *,
+    ${helpers.codes([
+      ["is_unparseable", "UNPARSEABLE_JSON"],
+      ["NOT is_unparseable AND client_id IS NULL", "MISSING_CLIENT_ID"],
+      ["NOT is_unparseable AND signup_date IS NULL", "INVALID_SIGNUP_DATE"],
+      ["email IS NOT NULL AND NOT REGEXP_CONTAINS(email, r'^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$')", "INVALID_EMAIL"],
+      ["client_id IS NOT NULL AND key_rows > 1", "DUPLICATE_CLIENT_ID"]
+    ])} AS error_codes,
+    ${helpers.codes([
+      [`signup_date > ${cfg.AS_OF_DATE}`, "SIGNUP_IN_FUTURE"],
+      ["kyc_status IS NULL OR kyc_status NOT IN ('approved', 'pending', 'rejected')", "UNKNOWN_KYC_STATUS"],
+      ["unmapped_keys IS NOT NULL", "UNMAPPED_KEYS"]
+    ])} AS warn_codes
+  FROM counted
+)
+
+SELECT
+  source_uri,
+  raw_payload,
+  client_id,
+  signup_date,
+  country,
+  email,
+  kyc_status,
+  account_type,
+  referral_source,
+  signup_platform,
+  promo_code,
+  assigned_manager,
+  unmapped_keys,
+  error_codes,
+  warn_codes,
+  IF(error_codes IS NULL, 'VALID', 'REJECTED') AS record_status
+FROM checked
